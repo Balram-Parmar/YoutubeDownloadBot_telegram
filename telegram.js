@@ -3,9 +3,9 @@ const fs = require("fs");
 const ytdl = require("ytdl-core");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegStatic = require("ffmpeg-static");
-const { get } = require("http");
-const { title } = require("process");
-const { error } = require("console");
+const { authorize, uploadFile } = require("./drive.js");
+const { PassThrough } = require("stream");
+const { info } = require("console");
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
@@ -77,24 +77,25 @@ bot.onText(
 async function processVideo(chatId, videoUrl, videoFormat, audioFormat, info) {
   try {
     await Promise.all([
-      downloadVideo(chatId, videoUrl, videoFormat),
-      downloadAudio(chatId, videoUrl, audioFormat),
+      downloadVideo(chatId, videoUrl, videoFormat, info),
+      downloadAudio(chatId, videoUrl, audioFormat, info),
     ]);
-    await mergeAudioAndVideo(chatId, info);
-    const link = await createDownloadLink(info);
-    bot.sendMessage(chatId, "Download link: " + link);
+
+    let id = await mergeAudioAndVideo(chatId, info);
+    bot.sendMessage(chatId, `Video processed successfully!`);
+    bot.sendMessage(chatId, `https://drive.google.com/file/d/${id}/view`);
   } catch (error) {
     console.error("Error processing video:", error);
     bot.sendMessage(chatId, "An error occurred while processing the video.");
   }
 }
 
-async function downloadVideo(chatId, videoUrl, videoFormat) {
+async function downloadVideo(chatId, videoUrl, videoFormat, info) {
   return new Promise((resolve, reject) => {
     try {
       bot.sendMessage(chatId, "Downloading video...");
       ytdl(videoUrl, { format: videoFormat })
-        .pipe(fs.createWriteStream("temp_video.mp4"))
+        .pipe(fs.createWriteStream(`tempv${info.videoDetails.title}.mp4`))
         .on("finish", resolve)
         .on("error", reject);
     } catch (error) {
@@ -104,12 +105,12 @@ async function downloadVideo(chatId, videoUrl, videoFormat) {
   });
 }
 
-async function downloadAudio(chatId, videoUrl, audioFormat) {
+async function downloadAudio(chatId, videoUrl, audioFormat, info) {
   return new Promise((resolve, reject) => {
     try {
       bot.sendMessage(chatId, "Downloading audio...");
       ytdl(videoUrl, { format: audioFormat })
-        .pipe(fs.createWriteStream("temp_audio.mp4"))
+        .pipe(fs.createWriteStream(`tempa${info.videoDetails.title}.mp4`))
         .on("finish", resolve)
         .on("error", reject);
     } catch (error) {
@@ -122,50 +123,69 @@ async function downloadAudio(chatId, videoUrl, audioFormat) {
 async function mergeAudioAndVideo(chatId, info) {
   return new Promise((resolve, reject) => {
     bot.sendMessage(chatId, "Merging audio and video...Please be patient!!");
-    ffmpeg()
-      .input("temp_video.mp4")
-      .input("temp_audio.mp4")
-      .videoCodec("copy")
-      .audioCodec("aac")
-      .on("end", () => {
-        console.log("Merging completed!");
-        fs.unlinkSync("temp_video.mp4");
-        fs.unlinkSync("temp_audio.mp4");
-        resolve();
-      })
-      .on("error", (err) => {
-        console.error("Error during merging:", err);
-        reject(err);
-      })
-      .save(info.videoDetails.title.replace(/[^\w\s-]/g, "") + ".mp4");
+    try {
+      const passThroughStream = new PassThrough();
+      ffmpeg()
+        .input(`tempv${info.videoDetails.title}.mp4`)
+        .input(`tempa${info.videoDetails.title}.mp4`)
+        .videoCodec("copy")
+        .audioCodec("aac")
+        .on("end", () => {
+          console.log("Merging completed!");
+          fs.unlinkSync(`tempv${info.videoDetails.title}.mp4`);
+          fs.unlinkSync(`tempa${info.videoDetails.title}.mp4`);
+        })
+        .on("error", (err) => {
+          console.error("Error during merging:", err);
+          fs.unlinkSync(`tempv${info.videoDetails.title}.mp4`);
+          fs.unlinkSync(`tempa${info.videoDetails.title}.mp4`);
+        })
+        .format("mp4")
+        .outputOptions("-movflags frag_keyframe+empty_moov")
+        .pipe(passThroughStream);
+
+      authorize().then((client) => {
+        let fid = uploadFile(
+          client,
+          info.videoDetails.title,
+          "video/mp4",
+          passThroughStream
+        );
+        console.log("File Id: this", fid);
+        resolve(fid);
+      });
+    } catch (error) {
+      console.error("Error in mergeAudioAndVideoStreams:", error);
+      reject(error);
+    }
   });
 }
 
-async function createDownloadLink(info) {
-  return new Promise((resolve, reject) => {
-    const url = "http://localhost:3000/create-download-link";
-    const headers = {
-      "Content-Type": "application/json",
-    };
-    const data = {
-      fileName: `${info.videoDetails.title.replace(/[^\w\s-]/g, "")}.mp4`,
-      expiryMinutes: 10,
-    };
-    fetch(url, {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(data),
-    })
-      .then((response) => response.json())
-      .then((responseData) => {
-        resolve(responseData.downloadLink);
-      })
-      .catch((error) => {
-        console.log("Error creating download link: ", error);
-        reject(error);
-      });
-  });
-}
+// async function createDownloadLink(info) {
+//   return new Promise((resolve, reject) => {
+//     const url = "http://localhost:3000/create-download-link";
+//     const headers = {
+//       "Content-Type": "application/json",
+//     };
+//     const data = {
+//       fileName: `${info.videoDetails.title.replace(/[^\w\s-]/g, "")}.mp4`,
+//       expiryMinutes: 10,
+//     };
+//     fetch(url, {
+//       method: "POST",
+//       headers: headers,
+//       body: JSON.stringify(data),
+//     })
+//       .then((response) => response.json())
+//       .then((responseData) => {
+//         resolve(responseData.downloadLink);
+//       })
+//       .catch((error) => {
+//         console.log("Error creating download link: ", error);
+//         reject(error);
+//       });
+//   });
+// }
 
 bot.on("callback_query", async (query) => {
   chatId = query.message.chat.id;
